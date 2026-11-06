@@ -46,12 +46,11 @@ function endSession(code, reason) {
   sessions.delete(code);
   clearTimeout(s.codeTimer);
   clearTimeout(s.maxTimer);
-  for (const w of [s.app, s.tech]) {
-    if (w && w.readyState === 1) {
-      send(w, { t: 'ended', reason });
-      w.close(1000, reason);
-    }
+  if (s.tech && s.tech.readyState === 1) {
+    send(s.tech, { t: 'ended', reason });
+    s.tech.close(1000, reason);
   }
+  if (s.app) s.app.end(reason);
 }
 
 function ipOf(req) {
@@ -74,7 +73,116 @@ function addFail(ip) {
   fails.set(ip, f);
 }
 
+// ---------- অ্যাপের HTTP পথ (ওয়েবসকেট প্রক্সিতে আটকালেও এটি চলে) ----------
+/** sid -> { sid, code, queue:[], waiter:null, lastSeen, ended } */
+const httpApps = new Map();
+
+function jsonRes(res, status, obj) {
+  const body = JSON.stringify(obj);
+  res.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+  res.end(body);
+}
+
+function flushApp(a) {
+  if (a.waiter && a.queue.length) {
+    const w = a.waiter;
+    a.waiter = null;
+    clearTimeout(w.t);
+    jsonRes(w.res, 200, a.queue.splice(0));
+  }
+}
+
+function pushApp(a, obj) {
+  a.queue.push(obj);
+  flushApp(a);
+}
+
+function readBody(req, limit, cb) {
+  const chunks = [];
+  let n = 0;
+  let dead = false;
+  req.on('data', (c) => {
+    if (dead) return;
+    n += c.length;
+    if (n > limit) {
+      dead = true;
+      req.destroy();
+      return;
+    }
+    chunks.push(c);
+  });
+  req.on('end', () => {
+    if (!dead) cb(Buffer.concat(chunks));
+  });
+}
+
+function handleApp(req, res, url) {
+  const path = url.pathname;
+  if (path === '/a/open' && req.method === 'POST') {
+    if (sessions.size >= 300) return jsonRes(res, 503, { error: 'busy' });
+    const code = newCode();
+    if (!code) return jsonRes(res, 503, { error: 'busy' });
+    const sid = crypto.randomBytes(16).toString('hex');
+    const a = { sid, code, queue: [], waiter: null, lastSeen: Date.now(), ended: false };
+    httpApps.set(sid, a);
+    const s = {
+      app: {
+        send: (o) => pushApp(a, o),
+        end: (r) => {
+          a.ended = true;
+          pushApp(a, { t: 'ended', reason: r });
+        },
+      },
+      tech: null,
+      codeTimer: null,
+      maxTimer: null,
+    };
+    sessions.set(code, s);
+    s.codeTimer = setTimeout(() => {
+      if (!s.tech) endSession(code, 'expired');
+    }, CODE_TTL_MS);
+    s.maxTimer = setTimeout(() => endSession(code, 'timeout'), SESSION_MAX_MS);
+    return jsonRes(res, 200, { sid, code, ttl: CODE_TTL_MS / 1000 });
+  }
+  const a = httpApps.get(url.searchParams.get('sid') || '');
+  if (!a) return jsonRes(res, 410, { error: 'gone' });
+  a.lastSeen = Date.now();
+  if (path === '/a/poll' && req.method === 'GET') {
+    if (a.waiter) {
+      clearTimeout(a.waiter.t);
+      jsonRes(a.waiter.res, 200, []);
+      a.waiter = null;
+    }
+    if (a.queue.length) return jsonRes(res, 200, a.queue.splice(0));
+    const t = setTimeout(() => {
+      if (a.waiter && a.waiter.res === res) {
+        a.waiter = null;
+        jsonRes(res, 200, []);
+      }
+    }, 25000);
+    a.waiter = { res, t };
+    return;
+  }
+  if (path === '/a/frame' && req.method === 'POST') {
+    return readBody(req, 2 * 1024 * 1024, (buf) => {
+      const s = sessions.get(a.code);
+      if (s && s.tech && s.tech.readyState === 1 && buf.length) {
+        s.tech.send(buf, { binary: true });
+      }
+      res.writeHead(204);
+      res.end();
+    });
+  }
+  if (path === '/a/close' && req.method === 'POST') {
+    endSession(a.code, 'app_closed');
+    return jsonRes(res, 200, {});
+  }
+  jsonRes(res, 404, { error: 'not found' });
+}
+
 const server = http.createServer((req, res) => {
+  const url = new URL(req.url, 'http://x');
+  if (url.pathname.startsWith('/a/')) return handleApp(req, res, url);
   if (req.url === '/health') {
     res.writeHead(200, { 'content-type': 'text/plain' });
     return res.end('ok');
@@ -114,7 +222,18 @@ function onApp(ws) {
     send(ws, { t: 'error', reason: 'busy' });
     return ws.close();
   }
-  const s = { app: ws, tech: null, codeTimer: null, maxTimer: null };
+  const s = {
+    app: {
+      send: (o) => send(ws, o),
+      end: (r) => {
+        send(ws, { t: 'ended', reason: r });
+        ws.close(1000, r);
+      },
+    },
+    tech: null,
+    codeTimer: null,
+    maxTimer: null,
+  };
   sessions.set(code, s);
   s.codeTimer = setTimeout(() => {
     if (!s.tech) endSession(code, 'expired');
@@ -166,14 +285,14 @@ function onTech(ws) {
       code = String(msg.code);
       s.tech = ws;
       send(ws, { t: 'joined' });
-      send(s.app, { t: 'joined' });
+      s.app.send({ t: 'joined' });
       return;
     }
     const s = sessions.get(code);
     if (!s || !s.app) return;
     if (msg.t === 'stop') return endSession(code, 'tech_stopped');
     if (['touch', 'text', 'key', 'next'].includes(msg.t)) {
-      s.app.send(JSON.stringify(msg));
+      s.app.send(msg);
     }
   });
   ws.on('close', () => {
@@ -194,6 +313,14 @@ setInterval(() => {
     ws.ping();
   }
 }, 25000);
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [sid, a] of httpApps) {
+    if (!a.ended && now - a.lastSeen > 50000) endSession(a.code, 'app_closed');
+    if (a.ended && now - a.lastSeen > 60000) httpApps.delete(sid);
+  }
+}, 10000);
 
 server.listen(PORT, () => {
   console.log('Green Net relay on port ' + PORT);
